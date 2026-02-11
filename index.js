@@ -1,14 +1,30 @@
 import OpenAI from "openai";
 import { Client as NotionClient } from "@notionhq/client";
 
-const {
-  OPENAI_API_KEY,
-  NOTION_API_KEY,
-  NOTION_DATABASE_ID
-} = process.env;
+const { OPENAI_API_KEY, NOTION_API_KEY, NOTION_DATABASE_ID } = process.env;
 
 if (!OPENAI_API_KEY || !NOTION_API_KEY || !NOTION_DATABASE_ID) {
-  console.error("Faltan variables de entorno: OPENAI_API_KEY, NOTION_API_KEY, NOTION_DATABASE_ID");
+  console.error(
+    "Faltan variables de entorno: OPENAI_API_KEY, NOTION_API_KEY, NOTION_DATABASE_ID"
+  );
+  process.exit(1);
+}
+
+function toNotionId(id) {
+  const clean = (id || "").trim().replace(/-/g, "");
+  if (!/^[0-9a-fA-F]{32}$/.test(clean)) return null;
+  return clean.replace(
+    /^(.{8})(.{4})(.{4})(.{4})(.{12})$/,
+    "$1-$2-$3-$4-$5"
+  );
+}
+
+const NOTION_DB = toNotionId(NOTION_DATABASE_ID);
+if (!NOTION_DB) {
+  console.error(
+    "NOTION_DATABASE_ID inválido. Debe ser 32 hex (con o sin guiones). Valor recibido:",
+    JSON.stringify(NOTION_DATABASE_ID)
+  );
   process.exit(1);
 }
 
@@ -20,22 +36,26 @@ const DEDUPE_LOOKBACK = 60;
 
 async function getRecentGamesFromNotion(limit = 50) {
   const res = await notion.databases.query({
-    database_id: NOTION_DATABASE_ID,
+    database_id: NOTION_DB,
     page_size: Math.min(limit, 100),
-    sorts: [{ property: "Fecha", direction: "descending" }]
+    sorts: [{ property: "Fecha", direction: "descending" }],
   });
 
   const names = [];
   for (const page of res.results) {
     const title = page?.properties?.["Juego"]?.title;
-    const text = Array.isArray(title) ? title.map(t => t?.plain_text || "").join("").trim() : "";
+    const text = Array.isArray(title)
+      ? title.map((t) => t?.plain_text || "").join("").trim()
+      : "";
     if (text) names.push(text);
   }
   return [...new Set(names)];
 }
 
 function safeJsonParse(str) {
-  try { return JSON.parse(str); } catch {}
+  try {
+    return JSON.parse(str);
+  } catch {}
   const start = str.indexOf("{");
   const end = str.lastIndexOf("}");
   if (start !== -1 && end !== -1 && end > start) {
@@ -70,26 +90,36 @@ function truncate(str, max = 1800) {
 
 async function createNotionItem(idea) {
   const properties = {
-    "Juego": { title: [{ text: { content: idea.juego } }] },
-    "Tipo": { select: { name: idea.tipo } },
-    "Popularidad": { select: { name: idea.popularidad } },
-    "Resumen": { rich_text: [{ text: { content: truncate(idea.resumen) } }] },
-    "Gancho": { rich_text: [{ text: { content: truncate(idea.gancho) } }] },
-    "Por qué tiene potencial": { rich_text: [{ text: { content: truncate(idea.por_que_tiene_potencial) } }] },
-    "Idea Short": { rich_text: [{ text: { content: truncate(idea.idea_short) } }] },
-    "Emoción": { select: { name: idea.emocion } },
+    Juego: { title: [{ text: { content: idea.juego } }] },
+    Tipo: { select: { name: idea.tipo } },
+    Popularidad: { select: { name: idea.popularidad } },
+    Resumen: { rich_text: [{ text: { content: truncate(idea.resumen) } }] },
+    Gancho: { rich_text: [{ text: { content: truncate(idea.gancho) } }] },
+    "Por qué tiene potencial": {
+      rich_text: [{ text: { content: truncate(idea.por_que_tiene_potencial) } }],
+    },
+    "Idea Short": {
+      rich_text: [{ text: { content: truncate(idea.idea_short) } }],
+    },
+    Emoción: { select: { name: idea.emocion } },
     "Score viral": { number: clampNumber(idea.score_viral, 1, 10, 7) },
-    "Fecha": { date: { start: new Date().toISOString() } },
+    Fecha: { date: { start: new Date().toISOString() } },
 
     // PRO (deben existir en Notion)
-    "Título SEO": { rich_text: [{ text: { content: truncate(idea.titulo_seo, 500) } }] },
-    "Guion 60s": { rich_text: [{ text: { content: truncate(idea.guion_60s) } }] },
-    "Guion 8 min": { rich_text: [{ text: { content: truncate(idea.guion_8min) } }] }
+    "Título SEO": {
+      rich_text: [{ text: { content: truncate(idea.titulo_seo, 500) } }],
+    },
+    "Guion 60s": {
+      rich_text: [{ text: { content: truncate(idea.guion_60s) } }],
+    },
+    "Guion 8 min": {
+      rich_text: [{ text: { content: truncate(idea.guion_8min) } }],
+    },
   };
 
   return notion.pages.create({
-    parent: { database_id: NOTION_DATABASE_ID },
-    properties
+    parent: { database_id: NOTION_DB },
+    properties,
   });
 }
 
@@ -159,7 +189,7 @@ Devuelve SOLO un JSON válido (sin markdown, sin texto extra) con este formato E
   const resp = await openai.chat.completions.create({
     model: "gpt-4o-mini",
     messages: [{ role: "user", content: PROMPT }],
-    temperature: 0.85
+    temperature: 0.85,
   });
 
   const content = (resp.choices?.[0]?.message?.content || "").trim();
@@ -199,10 +229,7 @@ Devuelve SOLO un JSON válido (sin markdown, sin texto extra) con este formato E
     return item;
   }
 
-  const merged = [
-    ...ideas.map(i => cleanItem(i)),
-    ...backups.map(i => cleanItem(i))
-  ];
+  const merged = [...ideas.map((i) => cleanItem(i)), ...backups.map((i) => cleanItem(i))];
 
   // Filtra repetidos (contra Notion y dentro del batch)
   const finalToSave = [];
