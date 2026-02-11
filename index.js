@@ -132,19 +132,25 @@ async function main() {
 Actúa como un analista experto en contenido viral de videojuegos para YouTube (España).
 Objetivo: proponer 3 videojuegos POCO CONOCIDOS con ALTO POTENCIAL de storytelling + 3 backups.
 
-RESTRICCIONES DURAS:
+RESTRICCIONES (ACTUALIDAD + STORY):
 - Evita AAA súper famosos y franquicias mainstream (Zelda, GTA, Elden Ring, The Last of Us, etc.).
 - NO repitas nada de esta lista (juegos ya usados recientemente): ${bannedList}
-- Prioriza indies, juegos de culto, joyas ocultas, títulos antiguos olvidados, rarezas.
-- Deben tener historia contable: misterio, giro, tragedia, terror, shock o nostalgia.
-- Cada propuesta debe dar material para: (1) un vídeo largo ~8 min y (2) un short ~60s.
-- Puntúa score_viral 1-10 (hook + historia + rareza + facilidad de narrar).
+- Prioriza juegos ACTUALES o recientes: lanzados en los últimos 3-4 años, o en early access / anunciados con fuerte tracción (2025–2026).
+- Se permiten "semi-famosos" SI cumplen: historia potente + gancho narrativo claro + algo raro/único (ejemplos válidos: Mewgenics, Starsand Island).
+- Prioriza indies, AA, juegos de culto modernos, joyas ocultas recientes, y proyectos prometedores.
+- Deben tener ALGO DE HISTORIA o lore narrable (mínimo 1): misterio, giro, tragedia, terror, shock, nostalgia, conspiración, “qué pasó aquí”, personaje con arco, mundo con secretos.
+- Cada propuesta debe dar material para:
+  (1) un vídeo largo ~8 min (historia/explicación) y/o
+  (2) un short ~60s (gancho + 1 revelación/curiosidad).
+- Puntúa score_viral 1-10 pensando en: hook + claridad del conflicto + rareza + actualidad (trend potential).
 
-CALIDAD:
-- Títulos realmente poco comunes (evita “semi-famosos”).
-- Gancho potente en 1 frase (estilo YouTube).
-- Resumen claro, sin spoilers grandes (o indica “spoiler-free”).
-- “Por qué tiene potencial” debe ser específico.
+CALIDAD (ANTI-GENÉRICO):
+- Nada de listas obvias o “lo de siempre”. Si es conocido, justifica por qué AÚN ASÍ es buen vídeo hoy.
+- Gancho en 1 frase estilo YouTube (emocional + específico).
+- Resumen claro (spoiler-free o marcando “con spoilers”).
+- “Por qué tiene potencial” debe ser concreto: qué misterio/conflicto, qué revelación, qué tema humano, qué escena “wow”.
+- Incluye una razón de actualidad: update reciente, early access, anuncio, resurgimiento, o comunidad en crecimiento.
+
 
 Devuelve SOLO un JSON válido (sin markdown, sin texto extra) con este formato EXACTO:
 
