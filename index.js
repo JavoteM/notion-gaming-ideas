@@ -1,76 +1,78 @@
 import OpenAI from "openai";
 import { Client as NotionClient } from "@notionhq/client";
+import Parser from "rss-parser";
 
-const { OPENAI_API_KEY, NOTION_API_KEY, NOTION_DATABASE_ID } = process.env;
+const { OPENAI_API_KEY, NOTION_API_KEY, NOTION_DATABASE_ID, RSS_DAYS, RSS_URLS } = process.env;
 
 if (!OPENAI_API_KEY || !NOTION_API_KEY || !NOTION_DATABASE_ID) {
-  console.error(
-    "Faltan variables de entorno: OPENAI_API_KEY, NOTION_API_KEY, NOTION_DATABASE_ID"
-  );
+  console.error("Faltan variables de entorno: OPENAI_API_KEY, NOTION_API_KEY, NOTION_DATABASE_ID");
   process.exit(1);
 }
 
 function toNotionId(id) {
   const clean = (id || "").trim().replace(/-/g, "");
   if (!/^[0-9a-fA-F]{32}$/.test(clean)) return null;
-  return clean.replace(
-    /^(.{8})(.{4})(.{4})(.{4})(.{12})$/,
-    "$1-$2-$3-$4-$5"
-  );
+  return clean.replace(/^(.{8})(.{4})(.{4})(.{4})(.{12})$/, "$1-$2-$3-$4-$5");
 }
-
 const NOTION_DB = toNotionId(NOTION_DATABASE_ID);
 if (!NOTION_DB) {
-  console.error(
-    "NOTION_DATABASE_ID inválido. Debe ser 32 hex (con o sin guiones). Valor recibido:",
-    JSON.stringify(NOTION_DATABASE_ID)
-  );
+  console.error("NOTION_DATABASE_ID inválido. Valor recibido:", JSON.stringify(NOTION_DATABASE_ID));
   process.exit(1);
 }
 
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 const notion = new NotionClient({ auth: NOTION_API_KEY });
+const parser = new Parser({ timeout: 15000 });
 
-// Cuántos juegos recientes lee de Notion para evitar repetidos
-const DEDUPE_LOOKBACK = 60;
+const DAYS = Number(RSS_DAYS || 7); // por defecto “semana”
+const MAX_ITEMS_FOR_MODEL = 28;      // para no inflar el prompt
+const MAX_PER_FEED = 20;
 
-async function getRecentGamesFromNotion(limit = 50) {
-  const res = await notion.databases.query({
-    database_id: NOTION_DB,
-    page_size: Math.min(limit, 100),
-    sorts: [{ property: "Fecha", direction: "descending" }],
-  });
+// Lista por defecto de RSS (puedes cambiarla vía env RSS_URLS)
+const DEFAULT_FEEDS = [
+  "https://www.rockpapershotgun.com/feed",
+  "https://www.pcgamer.com/rss/",
+  "https://www.gamesradar.com/feeds/all/",
+  "https://www.eurogamer.net/feed",
+  "https://www.destructoid.com/feed/",
+  "https://www.polygon.com/rss/index.xml",
+  "https://kotaku.com/rss",
+  "https://www.gematsu.com/feed"
+];
 
-  const names = [];
-  for (const page of res.results) {
-    const title = page?.properties?.["Juego"]?.title;
-    const text = Array.isArray(title)
-      ? title.map((t) => t?.plain_text || "").join("").trim()
-      : "";
-    if (text) names.push(text);
-  }
-  return [...new Set(names)];
+// Keywords para detectar “anuncio / demo / EA / MMO”
+const KEYWORDS = [
+  "announce", "announced", "announcement", "reveal", "revealed", "trailer",
+  "demo", "playtest", "early access", "launch", "release", "beta",
+  "mmo", "mmorpg", "online", "season", "live service",
+  "presentación", "anunciado", "anuncio", "revelado", "tráiler", "trailer",
+  "demo", "prueba", "playtest", "acceso anticipado", "lanzamiento", "beta",
+  "mmo", "mmorpg", "online"
+];
+
+function includesKeyword(text) {
+  const t = (text || "").toLowerCase();
+  return KEYWORDS.some(k => t.includes(k));
 }
 
-function safeJsonParse(str) {
-  try {
-    return JSON.parse(str);
-  } catch {}
-  const start = str.indexOf("{");
-  const end = str.lastIndexOf("}");
-  if (start !== -1 && end !== -1 && end > start) {
-    const sliced = str.slice(start, end + 1);
-    return JSON.parse(sliced);
-  }
-  throw new Error("No se pudo parsear JSON.");
+function parseDate(item) {
+  const d =
+    item.isoDate ||
+    item.pubDate ||
+    item.published ||
+    item.updated ||
+    null;
+  const dt = d ? new Date(d) : null;
+  return dt && !Number.isNaN(dt.getTime()) ? dt : null;
 }
 
-function normalizeGameName(s) {
-  return (s || "")
-    .toLowerCase()
-    .replace(/\s+/g, " ")
-    .replace(/[^\p{L}\p{N}\s:.-]/gu, "")
-    .trim();
+function normalizeKey(s) {
+  return (s || "").toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+function truncate(str, max = 1800) {
+  const s = (str ?? "").toString();
+  return s.length > max ? s.slice(0, max - 1) + "…" : s;
 }
 
 function clampNumber(n, min, max, fallback) {
@@ -83,76 +85,144 @@ function ensureOneOf(value, allowed, fallback) {
   return allowed.includes(value) ? value : fallback;
 }
 
-function truncate(str, max = 1800) {
-  const s = (str ?? "").toString();
-  return s.length > max ? s.slice(0, max - 1) + "…" : s;
+async function getDatabasePropertyNames() {
+  const db = await notion.databases.retrieve({ database_id: NOTION_DB });
+  return new Set(Object.keys(db?.properties || {}));
 }
 
-async function createNotionItem(idea) {
-  const properties = {
-    Juego: { title: [{ text: { content: idea.juego } }] },
-    Tipo: { select: { name: idea.tipo } },
-    Popularidad: { select: { name: idea.popularidad } },
-    Resumen: { rich_text: [{ text: { content: truncate(idea.resumen) } }] },
-    Gancho: { rich_text: [{ text: { content: truncate(idea.gancho) } }] },
-    "Por qué tiene potencial": {
-      rich_text: [{ text: { content: truncate(idea.por_que_tiene_potencial) } }],
-    },
-    "Idea Short": {
-      rich_text: [{ text: { content: truncate(idea.idea_short) } }],
-    },
-    Emoción: { select: { name: idea.emocion } },
-    "Score viral": { number: clampNumber(idea.score_viral, 1, 10, 7) },
-    Fecha: { date: { start: new Date().toISOString() } },
+async function fetchRecentRssItems() {
+  const cutoff = Date.now() - DAYS * 24 * 60 * 60 * 1000;
 
-    // PRO (deben existir en Notion)
-    "Título SEO": {
-      rich_text: [{ text: { content: truncate(idea.titulo_seo, 500) } }],
-    },
-    "Guion 60s": {
-      rich_text: [{ text: { content: truncate(idea.guion_60s) } }],
-    },
-    "Guion 8 min": {
-      rich_text: [{ text: { content: truncate(idea.guion_8min) } }],
-    },
-  };
+  const feeds = RSS_URLS
+    ? RSS_URLS.split(",").map(s => s.trim()).filter(Boolean)
+    : DEFAULT_FEEDS;
+
+  const all = [];
+  for (const feedUrl of feeds) {
+    try {
+      const feed = await parser.parseURL(feedUrl);
+      const source = feed?.title || feedUrl;
+
+      const items = (feed?.items || []).slice(0, MAX_PER_FEED);
+      for (const it of items) {
+        const dt = parseDate(it);
+        if (!dt) continue;
+        if (dt.getTime() < cutoff) continue;
+
+        const title = (it.title || "").trim();
+        const link = (it.link || "").trim();
+        const content = (it.contentSnippet || it.content || it.summary || "").toString();
+
+        const textBlob = `${title} ${content}`.toLowerCase();
+        if (!includesKeyword(textBlob)) continue;
+
+        all.push({
+          title,
+          link,
+          source,
+          date: dt.toISOString(),
+          snippet: truncate(content.replace(/\s+/g, " "), 280)
+        });
+      }
+    } catch (e) {
+      console.log("RSS fail:", feedUrl, "-", e?.message || e);
+    }
+  }
+
+  // Dedup por link o título+fuente
+  const seen = new Set();
+  const deduped = [];
+  for (const x of all) {
+    const key = x.link ? `L:${normalizeKey(x.link)}` : `T:${normalizeKey(x.title)}|${normalizeKey(x.source)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(x);
+  }
+
+  // Más recientes primero
+  deduped.sort((a, b) => (a.date < b.date ? 1 : -1));
+
+  return deduped.slice(0, MAX_ITEMS_FOR_MODEL);
+}
+
+function safeJsonParse(str) {
+  try { return JSON.parse(str); } catch {}
+  const start = str.indexOf("{");
+  const end = str.lastIndexOf("}");
+  if (start !== -1 && end !== -1 && end > start) {
+    return JSON.parse(str.slice(start, end + 1));
+  }
+  throw new Error("No se pudo parsear JSON.");
+}
+
+async function createNotionItem(idea, dbProps) {
+  // Solo añadimos propiedades que existan en la DB
+  const props = {};
+
+  function setIfExists(name, value) {
+    if (dbProps.has(name) && value !== undefined && value !== null) props[name] = value;
+  }
+
+  // Mapeo base (lo que ya tenías)
+  setIfExists("Juego", { title: [{ text: { content: idea.juego } }] });
+  setIfExists("Tipo", { select: { name: idea.tipo } });
+  setIfExists("Popularidad", { select: { name: idea.popularidad } });
+  setIfExists("Resumen", { rich_text: [{ text: { content: truncate(idea.resumen) } }] });
+  setIfExists("Gancho", { rich_text: [{ text: { content: truncate(idea.gancho) } }] });
+  setIfExists("Por qué tiene potencial", { rich_text: [{ text: { content: truncate(idea.por_que_tiene_potencial) } }] });
+  setIfExists("Idea Short", { rich_text: [{ text: { content: truncate(idea.idea_short) } }] });
+  setIfExists("Emoción", { select: { name: idea.emocion } });
+  setIfExists("Score viral", { number: clampNumber(idea.score_viral, 1, 10, 7) });
+  setIfExists("Fecha", { date: { start: new Date().toISOString() } });
+
+  // PRO (si existen)
+  setIfExists("Título SEO", { rich_text: [{ text: { content: truncate(idea.titulo_seo, 500) } }] });
+  setIfExists("Guion 60s", { rich_text: [{ text: { content: truncate(idea.guion_60s) } }] });
+  setIfExists("Guion 8 min", { rich_text: [{ text: { content: truncate(idea.guion_8min) } }] });
+
+  // NUEVAS (si las creas)
+  setIfExists("Link", { url: idea.link || null });
+  setIfExists("Fuente", { rich_text: [{ text: { content: truncate(idea.fuente, 300) } }] });
+  setIfExists("Fecha anuncio", { date: { start: idea.fecha_anuncio || null } });
 
   return notion.pages.create({
     parent: { database_id: NOTION_DB },
-    properties,
+    properties: props
   });
 }
 
 async function main() {
-  console.log("Leyendo últimos juegos de Notion para evitar repetidos...");
-  const recentGames = await getRecentGamesFromNotion(DEDUPE_LOOKBACK);
-  const bannedList = recentGames.length ? recentGames.join(" | ") : "(vacío)";
+  console.log(`RSS: buscando anuncios de los últimos ${DAYS} días...`);
+  const items = await fetchRecentRssItems();
+
+  if (!items.length) {
+    console.log("No se encontraron items recientes en RSS con keywords. (Sube RSS_DAYS o añade RSS_URLS)");
+    return;
+  }
+
+  // Lista compacta para el modelo
+  const feedBlock = items
+    .map((x, i) => {
+      return `${i + 1}) [${x.date}] (${x.source}) ${x.title}\nLINK: ${x.link}\nSNIP: ${x.snippet}`;
+    })
+    .join("\n\n");
 
   const PROMPT = `
-Actúa como un analista experto en contenido viral de videojuegos para YouTube (España).
-Objetivo: proponer 3 videojuegos POCO CONOCIDOS con ALTO POTENCIAL de storytelling + 3 backups.
+Eres un analista de tendencias gaming para YouTube (España).
+Te paso noticias RSS recientes (últimos ${DAYS} días). Tu tarea es elegir los MEJORES candidatos para contenido.
 
-RESTRICCIONES (ACTUALIDAD + STORY):
-- Evita AAA súper famosos y franquicias mainstream (Zelda, GTA, Elden Ring, The Last of Us, etc.).
-- NO repitas nada de esta lista (juegos ya usados recientemente): ${bannedList}
-- Prioriza juegos ACTUALES o recientes: lanzados en los últimos 3-4 años, o en early access / anunciados con fuerte tracción (2025–2026).
-- Se permiten "semi-famosos" SI cumplen: historia potente + gancho narrativo claro + algo raro/único (ejemplos válidos: Mewgenics, Starsand Island).
-- Prioriza indies, AA, juegos de culto modernos, joyas ocultas recientes, y proyectos prometedores.
-- Deben tener ALGO DE HISTORIA o lore narrable (mínimo 1): misterio, giro, tragedia, terror, shock, nostalgia, conspiración, “qué pasó aquí”, personaje con arco, mundo con secretos.
-- Cada propuesta debe dar material para:
-  (1) un vídeo largo ~8 min (historia/explicación) y/o
-  (2) un short ~60s (gancho + 1 revelación/curiosidad).
-- Puntúa score_viral 1-10 pensando en: hook + claridad del conflicto + rareza + actualidad (trend potential).
+OBJETIVO:
+- Devuelve 3 "ideas" + 3 "backups".
+- Deben ser juegos actuales o próximos (anuncio, demo, playtest, early access, beta, MMO, live service).
+- Priorización: potencial de repercusión/hype/debate + facilidad de explicarlo + novedad.
 
-CALIDAD (ANTI-GENÉRICO):
-- Nada de listas obvias o “lo de siempre”. Si es conocido, justifica por qué AÚN ASÍ es buen vídeo hoy.
-- Gancho en 1 frase estilo YouTube (emocional + específico).
-- Resumen claro (spoiler-free o marcando “con spoilers”).
-- “Por qué tiene potencial” debe ser concreto: qué misterio/conflicto, qué revelación, qué tema humano, qué escena “wow”.
-- Incluye una razón de actualidad: update reciente, early access, anuncio, resurgimiento, o comunidad en crecimiento.
+REGLAS:
+- No inventes: si el feed no confirma algo, no lo afirmes como hecho.
+- Elige preferentemente items con LINK claro a la fuente.
+- Si hay MMOs prometedores en la lista, incluye al menos 1 entre ideas/backups (siempre que sea relevante).
+- Score_viral 1-10: novedad + hype + gancho + facilidad de narrar.
 
-
-Devuelve SOLO un JSON válido (sin markdown, sin texto extra) con este formato EXACTO:
+DEVUELVE SOLO JSON válido (sin markdown, sin texto extra) con este formato EXACTO:
 
 {
   "ideas": [
@@ -167,8 +237,11 @@ Devuelve SOLO un JSON válido (sin markdown, sin texto extra) con este formato E
       "emocion": "Misterio|Tragedia|Shock|Terror|Nostalgia|Asombro",
       "score_viral": 1,
       "titulo_seo": "",
-      "guion_60s": "Estructura en bullets: HOOK (0-3s), CONTEXTO (3-10s), GIRO (10-40s), REMATE/CTA (40-60s).",
-      "guion_8min": "Estructura en bullets con timestamps aproximados: 0:00 hook, 0:20 contexto, 1:30 personajes/mundo, 3:00 conflicto/misterio, 5:30 giro/revelación, 7:00 cierre/reflexión, 7:40 CTA."
+      "guion_60s": "",
+      "guion_8min": "",
+      "fuente": "",
+      "link": "",
+      "fecha_anuncio": ""
     }
   ],
   "backups": [
@@ -184,18 +257,23 @@ Devuelve SOLO un JSON válido (sin markdown, sin texto extra) con este formato E
       "score_viral": 1,
       "titulo_seo": "",
       "guion_60s": "",
-      "guion_8min": ""
+      "guion_8min": "",
+      "fuente": "",
+      "link": "",
+      "fecha_anuncio": ""
     }
   ]
 }
+
+NOTICIAS RSS:
+${feedBlock}
 `.trim();
 
-  console.log("Generando ideas con IA...");
-
+  console.log("Generando selección con IA...");
   const resp = await openai.chat.completions.create({
     model: "gpt-4o-mini",
     messages: [{ role: "user", content: PROMPT }],
-    temperature: 0.85,
+    temperature: 0.6
   });
 
   const content = (resp.choices?.[0]?.message?.content || "").trim();
@@ -203,58 +281,43 @@ Devuelve SOLO un JSON válido (sin markdown, sin texto extra) con este formato E
 
   const ideas = Array.isArray(data?.ideas) ? data.ideas : [];
   const backups = Array.isArray(data?.backups) ? data.backups : [];
+  const merged = [...ideas, ...backups].slice(0, 6);
 
-  if (ideas.length < 1) {
-    console.error("La IA no devolvió ideas en el formato esperado:", content);
+  if (!merged.length) {
+    console.error("La IA no devolvió ideas en el formato esperado.");
+    console.log("RAW:", content);
     process.exit(1);
   }
 
+  // Validación selects para que Notion no falle
   const allowedTipo = ["Historia", "Short", "Ambos"];
   const allowedPop = ["Muy poco conocido", "Nicho"];
   const allowedEmo = ["Misterio", "Tragedia", "Shock", "Terror", "Nostalgia", "Asombro"];
 
-  const recentSet = new Set(recentGames.map(normalizeGameName));
-  const seen = new Set();
+  const cleaned = merged.map(x => ({
+    juego: (x.juego || "").toString().trim(),
+    tipo: ensureOneOf(x.tipo, allowedTipo, "Ambos"),
+    popularidad: ensureOneOf(x.popularidad, allowedPop, "Nicho"),
+    resumen: (x.resumen || "").toString().trim(),
+    gancho: (x.gancho || "").toString().trim(),
+    por_que_tiene_potencial: (x.por_que_tiene_potencial || "").toString().trim(),
+    idea_short: (x.idea_short || "").toString().trim(),
+    emocion: ensureOneOf(x.emocion, allowedEmo, "Asombro"),
+    score_viral: clampNumber(x.score_viral, 1, 10, 7),
+    titulo_seo: (x.titulo_seo || "").toString().trim(),
+    guion_60s: (x.guion_60s || "").toString().trim(),
+    guion_8min: (x.guion_8min || "").toString().trim(),
+    fuente: (x.fuente || "").toString().trim(),
+    link: (x.link || "").toString().trim(),
+    fecha_anuncio: (x.fecha_anuncio || "").toString().trim()
+  })).filter(x => x.juego);
 
-  function cleanItem(x) {
-    const item = { ...x };
-    item.juego = (item.juego || "").toString().trim();
-    item.tipo = ensureOneOf(item.tipo, allowedTipo, "Ambos");
-    item.popularidad = ensureOneOf(item.popularidad, allowedPop, "Nicho");
-    item.emocion = ensureOneOf(item.emocion, allowedEmo, "Misterio");
-    item.score_viral = clampNumber(item.score_viral, 1, 10, 7);
+  const dbProps = await getDatabasePropertyNames();
 
-    item.resumen = (item.resumen || "").toString().trim();
-    item.gancho = (item.gancho || "").toString().trim();
-    item.por_que_tiene_potencial = (item.por_que_tiene_potencial || "").toString().trim();
-    item.idea_short = (item.idea_short || "").toString().trim();
-    item.titulo_seo = (item.titulo_seo || "").toString().trim();
-    item.guion_60s = (item.guion_60s || "").toString().trim();
-    item.guion_8min = (item.guion_8min || "").toString().trim();
-
-    return item;
-  }
-
-  const merged = [...ideas.map((i) => cleanItem(i)), ...backups.map((i) => cleanItem(i))];
-
-  // Filtra repetidos (contra Notion y dentro del batch)
-  const finalToSave = [];
-  for (const item of merged) {
-    const key = normalizeGameName(item.juego);
-    if (!item.juego) continue;
-    if (recentSet.has(key)) continue;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    finalToSave.push(item);
-  }
-
-  // Guarda máximo 6 (3+3)
-  const capped = finalToSave.slice(0, 6);
-
-  console.log(`Guardando ${capped.length} items en Notion...`);
-  for (const item of capped) {
-    await createNotionItem(item);
-    console.log("✅ Guardada:", item.juego);
+  console.log(`Guardando ${cleaned.length} items en Notion...`);
+  for (const idea of cleaned) {
+    await createNotionItem(idea, dbProps);
+    console.log("✅ Guardada:", idea.juego);
   }
 
   console.log("Hecho.");
