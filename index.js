@@ -39,11 +39,10 @@ const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 const notion = new NotionClient({ auth: NOTION_API_KEY });
 const parser = new Parser({ timeout: 15000 });
 
-const DAYS = Number(RSS_DAYS || 7); // por defecto “semana”
-const MAX_ITEMS_FOR_MODEL = 28; // para no inflar el prompt
+const DAYS = Number(RSS_DAYS || 7);
+const MAX_ITEMS_FOR_MODEL = 28;
 const MAX_PER_FEED = 20;
 
-// Lista por defecto de RSS (puedes cambiarla vía env RSS_URLS)
 const DEFAULT_FEEDS = [
   "https://www.rockpapershotgun.com/feed",
   "https://www.pcgamer.com/rss/",
@@ -55,7 +54,6 @@ const DEFAULT_FEEDS = [
   "https://www.gematsu.com/feed"
 ];
 
-// Keywords para detectar “anuncio / demo / EA / MMO”
 const KEYWORDS = [
   "announce",
   "announced",
@@ -166,7 +164,6 @@ async function fetchRecentRssItems() {
     }
   }
 
-  // Dedup por link o título+fuente
   const seen = new Set();
   const deduped = [];
   for (const x of all) {
@@ -178,9 +175,7 @@ async function fetchRecentRssItems() {
     deduped.push(x);
   }
 
-  // Más recientes primero
   deduped.sort((a, b) => (a.date < b.date ? 1 : -1));
-
   return deduped.slice(0, MAX_ITEMS_FOR_MODEL);
 }
 
@@ -197,11 +192,20 @@ function safeJsonParse(str) {
 }
 
 async function createNotionItem(idea, dbProps) {
-  // Solo añadimos propiedades que existan en la DB
   const props = {};
 
   function setIfExists(name, value) {
     if (dbProps.has(name) && value !== undefined && value !== null) props[name] = value;
+  }
+
+  // Notion NO acepta date.start = null (ni string vacío). Solo setea si es fecha válida.
+  function setDateIfValid(name, isoLike) {
+    if (!dbProps.has(name)) return;
+    const v = (isoLike ?? "").toString().trim();
+    if (!v) return;
+    const dt = new Date(v);
+    if (Number.isNaN(dt.getTime())) return;
+    props[name] = { date: { start: dt.toISOString() } };
   }
 
   // Base
@@ -210,7 +214,9 @@ async function createNotionItem(idea, dbProps) {
   setIfExists("Popularidad", { select: { name: idea.popularidad } });
   setIfExists("Emoción", { select: { name: idea.emocion } });
   setIfExists("Score viral", { number: clampNumber(idea.score_viral, 1, 10, 7) });
-  setIfExists("Fecha", { date: { start: new Date().toISOString() } });
+
+  // Fecha de creación del item (siempre válida)
+  setDateIfValid("Fecha", new Date().toISOString());
 
   setIfExists("Resumen", { rich_text: [{ text: { content: truncate(idea.resumen) } }] });
   setIfExists("Gancho", { rich_text: [{ text: { content: truncate(idea.gancho) } }] });
@@ -219,19 +225,21 @@ async function createNotionItem(idea, dbProps) {
   });
   setIfExists("Idea Short", { rich_text: [{ text: { content: truncate(idea.idea_short) } }] });
 
-  // PRO (si existen)
+  // PRO
   setIfExists("Título SEO", {
     rich_text: [{ text: { content: truncate(idea.titulo_seo, 500) } }]
   });
   setIfExists("Guion 60s", { rich_text: [{ text: { content: truncate(idea.guion_60s) } }] });
   setIfExists("Guion 8 min", { rich_text: [{ text: { content: truncate(idea.guion_8min) } }] });
 
-  // Nuevas (si existen)
+  // Nuevas
   setIfExists("Link", { url: idea.link || null });
   setIfExists("Fuente", { rich_text: [{ text: { content: truncate(idea.fuente, 300) } }] });
-  setIfExists("Fecha anuncio", { date: { start: idea.fecha_anuncio || null } });
 
-  // IMPORTANTES: campos que tenías en Notion y faltaban en el workflow
+  // ✅ FIX REAL: no se setea si viene vacío (evita start:null)
+  setDateIfValid("Fecha anuncio", idea.fecha_anuncio);
+
+  // Campos de tu DB
   setIfExists("Tipo de juego", { select: { name: idea.tipo_de_juego } });
   setIfExists("Estado lanzamiento", { select: { name: idea.estado_lanzamiento } });
   setIfExists("Año", { number: idea.ano ?? null });
@@ -253,7 +261,6 @@ async function main() {
     return;
   }
 
-  // Lista compacta para el modelo
   const feedBlock = items
     .map((x, i) => {
       return `${i + 1}) [${x.date}] (${x.source}) ${x.title}\nLINK: ${x.link}\nSNIP: ${x.snippet}`;
@@ -279,6 +286,7 @@ CAMPOS IMPORTANTES (NO INVENTAR):
 - "estado_lanzamiento" debe ser UNO de: Recién lanzado | Demo disponible | Early Access | Próximo lanzamiento | Anunciado
 - "tipo_de_juego" debe ser UNO de: Live Service | Otro | Sandbox | Estrategia | Simulador | RPG | Roguelike | MMO | AA | Indie
 - "ano" (Año) si NO se conoce por la noticia, pon null.
+- "fecha_anuncio": si no está clara, pon "" (vacío). No inventes.
 
 DEVUELVE SOLO JSON válido (sin markdown, sin texto extra) con este formato EXACTO:
 
@@ -353,12 +361,10 @@ ${feedBlock}
     process.exit(1);
   }
 
-  // Validación selects para que Notion no falle
   const allowedTipo = ["Historia", "Short", "Ambos"];
   const allowedPop = ["Muy poco conocido", "Nicho"];
   const allowedEmo = ["Misterio", "Tragedia", "Shock", "Terror", "Nostalgia", "Asombro"];
 
-  // Según tu Notion (captura)
   const allowedEstadoLanzamiento = [
     "Recién lanzado",
     "Demo disponible",
@@ -388,7 +394,6 @@ ${feedBlock}
       emocion: ensureOneOf(x.emocion, allowedEmo, "Asombro"),
       score_viral: clampNumber(x.score_viral, 1, 10, 7),
 
-      // NUEVOS CAMPOS
       estado_lanzamiento: ensureOneOf(
         (x.estado_lanzamiento || "").toString().trim(),
         allowedEstadoLanzamiento,
@@ -399,9 +404,10 @@ ${feedBlock}
         allowedTipoJuego,
         "Otro"
       ),
-      ano: x.ano === null || x.ano === undefined || x.ano === ""
-        ? null
-        : clampNumber(x.ano, 1980, 2100, null),
+      ano:
+        x.ano === null || x.ano === undefined || x.ano === ""
+          ? null
+          : clampNumber(x.ano, 1980, 2100, null),
 
       resumen: (x.resumen || "").toString().trim(),
       gancho: (x.gancho || "").toString().trim(),
